@@ -104,7 +104,7 @@ docker run --publish 8888:8888 apricotlab
 
 This will launch a JupyterLab instance with APRICOT pre-installed.
 
-## 🛠 Development Installation
+## 🛠️ Development Installation
 
 > Note: Node.js is required for building the extension.
 > Note: The `jlpm` command is JupyterLab's pinned version of [yarn](https://yarnpkg.com/) that is installed with JupyterLab.
@@ -161,3 +161,9 @@ For packaging and releasing, see [RELEASE.md](RELEASE.md).
 ## 🛡️ License
 
 Distributed under the BSD 3-Clause License.
+
+---
+
+> This JupyterLab extension was originally developed as part of my work at [GRyCAP](https://github.com/grycap) and integrates with their open-source infrastructure deployment tool.  
+> 🔁 APRICOTLab is an open-source JupyterLab extension originally developed by Antonio Sánchez ([@asancheez](https://github.com/asancheez)) at GRyCAP.  
+> 🛠️ Maintained here to reflect latest updates and improvements.
