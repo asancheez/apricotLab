@@ -1,18 +1,21 @@
 import * as jsyaml from 'js-yaml';
-import { ContentsManager, KernelManager } from '@jupyterlab/services';
+
+import { ContentsManager } from '@jupyterlab/services';
 import { Widget } from '@lumino/widgets';
 import { Dialog, Notification } from '@jupyterlab/apputils';
+
 import {
   executeKernelCommand,
   getDeployableTemplatesPath,
   getInfrastructuresListPath,
   getIMClientPath,
-  getDeployedTemplatePath
+  getDeployedTemplatePath,
+  getAuthFilePath,
+  createButton
 } from './utils';
 
 interface IDeployInfo {
-  IMuser: string;
-  IMpass: string;
+  accessToken: any;
   recipe: string;
   id: string;
   deploymentType: string;
@@ -24,16 +27,13 @@ interface IDeployInfo {
   authVersion: string;
   domain: string;
   vo: string;
-  EGIToken: any;
-  worker: {
-    num_instances: number;
-    num_cpus: number;
-    mem_size: string;
-    disk_size: string;
-    num_gpus: number;
-    image: string;
-    [key: string]: number | string;
+  custom: string;
+  image: string;
+
+  inputs: {
+    [key: string]: string;
   };
+
   childs: string[];
 }
 
@@ -51,8 +51,10 @@ interface ITemplateInput {
 
 type UserInput = {
   name: string;
+  type: string;
   inputs: {
     [key: string]: {
+      type: string;
       description: string;
       default: any;
       value: any;
@@ -63,8 +65,7 @@ type UserInput = {
 };
 
 interface IInfrastructureData {
-  IMuser: string;
-  IMpass: string;
+  accessToken: string;
   name: string;
   infrastructureID: string;
   id: string;
@@ -76,12 +77,11 @@ interface IInfrastructureData {
   authVersion: string;
   domain: string;
   vo: string;
-  EGIToken: string;
+  custom: string;
 }
 
 const deployInfo: IDeployInfo = {
-  IMuser: '',
-  IMpass: '',
+  accessToken: '',
   recipe: '',
   id: '',
   deploymentType: '',
@@ -93,38 +93,37 @@ const deployInfo: IDeployInfo = {
   authVersion: '',
   domain: '',
   vo: '',
-  EGIToken: '',
-  worker: {
-    num_instances: 1,
-    num_cpus: 1,
-    mem_size: '2 GB',
-    disk_size: '20 GB',
-    num_gpus: 1,
-    image: ''
-  },
+  custom: 'false',
+
+  inputs: {}, // holds all fe_* and wn_* key-value pairs
+  image: '',
+
   childs: []
 };
 
 const recipes: IRecipe[] = [
   {
-    name: 'Simple-node-disk',
+    name: 'Simple node disk',
     childs: ['galaxy', 'ansible_tasks', 'noderedvm', 'minio_compose']
   },
   {
     name: 'Slurm',
-    childs: ['slurm_cluster', 'slurm_elastic', 'slurm_galaxy', 'docker_cluster']
+    childs: ['slurm_elastic', 'slurm_galaxy', 'docker_cluster']
   },
   {
     name: 'Kubernetes',
     childs: [
-      'kubernetes',
       'kubeapps',
       'prometheus',
       'minio_compose',
-      'noderedvm',
+      'nodered',
       'influxdb',
       'argo'
     ]
+  },
+  {
+    name: 'Custom recipe',
+    childs: []
   }
 ];
 
@@ -135,9 +134,52 @@ const providers = {
   EC2: { id: 'ec2', deploymentType: 'EC2' }
 };
 
+const excludedKeys = new Set([
+  'instance_type',
+  'swap_size',
+  'storage_size',
+  'mount_path',
+  'gpu_vendor',
+  'gpu_model',
+  'ports',
+  'fe_instance_type',
+  'fe_disk_size',
+  'fe_volume_id',
+  'fe_kube_nvidia_support',
+  'fe_mount_path',
+  'fe_ports',
+  'wn_gpu_vendor',
+  'wn_gpu_model',
+  'wn_instance_type',
+  'wn_disk_size',
+  'wn_kube_nvidia_support',
+  'wn_mount_path'
+]);
+
+const resetDeployInfo = () => {
+  deployInfo.infName = '';
+  deployInfo.id = '';
+  deployInfo.deploymentType = '';
+  deployInfo.host = '';
+  deployInfo.tenant = '';
+  deployInfo.username = '';
+  deployInfo.password = '';
+  deployInfo.authVersion = '';
+  deployInfo.domain = '';
+  deployInfo.vo = '';
+  deployInfo.accessToken = '';
+};
+
+const footerButtonContainer = document.createElement('div');
+footerButtonContainer.className = 'footer-button-container';
+
+const contentsManager = new ContentsManager();
+
 let imageOptions: { uri: string; name: string }[] = [];
 
 let deploying = false; // Flag to prevent multiple deployments at the same time
+
+const imEndpoint = 'https://im.egi.eu/im';
 
 //*****************//
 //* Aux functions *//
@@ -146,7 +188,7 @@ let deploying = false; // Flag to prevent multiple deployments at the same time
 async function openDeploymentDialog(): Promise<void> {
   const dialogContent = document.createElement('div');
 
-  deployChooseProvider(dialogContent);
+  deployRecipeType(dialogContent);
 
   const contentWidget = new Widget({ node: dialogContent });
 
@@ -156,25 +198,21 @@ async function openDeploymentDialog(): Promise<void> {
     buttons: []
   });
 
+  // Prevent the use of the Enter button, except in text areas
+  (dialog as any)._evtKeydown = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement;
+
+    const isTextArea = target && target.tagName === 'TEXTAREA';
+
+    // Allow Enter in textarea, block everywhere else
+    if ((event.key === 'Enter' || event.key === 'Escape') && !isTextArea) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+
   dialog.launch();
 }
-
-const createButton = (
-  label: string,
-  onClick: () => void
-): HTMLButtonElement => {
-  const button = document.createElement('button');
-  button.textContent = label;
-  button.className = 'jp-Button';
-
-  // Add footer-button class for specific buttons
-  if (['Back', 'Next', 'Deploy'].includes(label)) {
-    button.classList.add('footer-button');
-  }
-
-  button.addEventListener('click', onClick);
-  return button;
-};
 
 const addFormInput = (
   form: HTMLFormElement,
@@ -182,20 +220,29 @@ const addFormInput = (
   inputId: string,
   value: string = '',
   type: string = 'text',
-  defaultValue?: string
-): void => {
+  defaultValue?: string,
+  name?: string,
+  placeholder?: string
+): HTMLInputElement => {
   const label = document.createElement('label');
   label.textContent = labelText;
+  label.htmlFor = inputId;
   form.appendChild(label);
 
   const input = document.createElement('input');
   input.type = type;
   input.id = inputId;
-  input.value = value;
+  input.name = name || inputId; // fallback to id
+  input.value = value || defaultValue || '';
+  input.required = true;
+  if (placeholder) {
+    input.placeholder = placeholder;
+  }
   input.classList.add('jp-InputArea-editor', 'cm-editor');
 
   form.appendChild(input);
-  form.appendChild(document.createElement('br'));
+
+  return input;
 };
 
 function getInputValue(inputId: string): string {
@@ -203,22 +250,15 @@ function getInputValue(inputId: string): string {
   return input.value;
 }
 
-async function computeHash(input: string): Promise<string> {
-  const msgUint8 = new TextEncoder().encode(input);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-  return hashHex;
-}
-
-async function generateIMCredentials(): Promise<void> {
-  const randomInput = `${Date.now()}-${Math.random()}`;
-  const hash = await computeHash(randomInput);
-  // Use first 16 characters for user and next 16 characters for password
-  const user = hash.substring(0, 16);
-  const pass = hash.substring(16, 32);
-  deployInfo.IMuser = user;
-  deployInfo.IMpass = pass;
+function detectRecipeFormat(content: string): 'radl' | 'yaml' | 'json' {
+  const trimmed = content.trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    return 'json';
+  }
+  if (trimmed.includes('tosca_definitions_version')) {
+    return 'yaml';
+  }
+  return 'radl';
 }
 
 async function createImagesDropdown(
@@ -233,15 +273,21 @@ async function createImagesDropdown(
   // Check if the output contains "error" in the message
   if (output.toLowerCase().includes('error')) {
     console.error(output);
-    Notification.error('No OS images found. Bad provider credentials.', {
-      autoClose: 5000
-    });
+    Notification.error(
+      'No OS images found. Bad provider credentials or expired token.',
+      {
+        autoClose: 5000
+      }
+    );
   }
 
   // Find the first occurrence of '[' and get the substring from there
   const jsonStartIndex = output.indexOf('[');
-  if (jsonStartIndex === -1) {
-    console.error('No OS images found. Check provider credentials.');
+  const jsonEndIndex = output.lastIndexOf(']') + 1;
+  if (jsonStartIndex === -1 || jsonEndIndex === -1) {
+    console.error(
+      'No OS images found. Check provider credentials or valid access token.'
+    );
     return;
   }
 
@@ -250,7 +296,7 @@ async function createImagesDropdown(
   try {
     const images: { uri: string; name: string }[] = JSON.parse(jsonOutput);
     imageOptions = images;
-    console.log('Parsed images:', images);
+    // console.log('Parsed images:', images);
 
     // Clear the dropdown container before appending new content
     dropdownContainer.innerHTML = '';
@@ -277,93 +323,121 @@ async function createImagesDropdown(
   }
 }
 
-async function mergeTOSCARecipes(
+export async function mergeTOSCARecipes(
   parsedConstantTemplate: any,
   userInputs: UserInput[] | undefined,
   nodeTemplates: any[] | undefined,
   outputs: any[] | undefined
 ): Promise<any> {
   try {
-    // Clone the parsed constant template to avoid mutating the original
+    // Deep clone to avoid mutating original
     const mergedTemplate = JSON.parse(JSON.stringify(parsedConstantTemplate));
 
-    // Process user inputs if defined and not empty
+    // Ensure topology_template exists
+    if (!mergedTemplate.topology_template) {
+      mergedTemplate.topology_template = {};
+    }
+
+    // Initialize required sections if missing
+    for (const key of ['inputs', 'node_templates', 'outputs']) {
+      if (!mergedTemplate.topology_template[key]) {
+        mergedTemplate.topology_template[key] = {};
+      }
+    }
+
+    // Handle user inputs
     if (userInputs && userInputs.length > 0) {
       const populatedTemplates = await Promise.all(userInputs);
 
-      // Ensure populatedTemplates is not undefined
-      if (populatedTemplates) {
-        populatedTemplates.forEach(template => {
-          if (template && template.inputs) {
-            Object.entries(template.inputs).forEach(([inputName, input]) => {
-              if (typeof input === 'object' && input !== null) {
-                const inputValue = (input as ITemplateInput).value;
+      for (const template of populatedTemplates) {
+        if (template && template.inputs) {
+          for (const [inputName, input] of Object.entries(template.inputs)) {
+            if (typeof input === 'object' && input !== null) {
+              const inputTyped = input as ITemplateInput;
 
-                // Merge or add inputs in the constant template
-                if (inputName in mergedTemplate.topology_template.inputs) {
-                  mergedTemplate.topology_template.inputs[inputName].default =
-                    inputValue;
-                } else {
-                  mergedTemplate.topology_template.inputs = {
-                    ...mergedTemplate.topology_template.inputs,
-                    [inputName]: {
-                      type: 'string',
-                      description: inputName,
-                      default: inputValue
-                    }
-                  };
-                }
-              }
-            });
-          }
-
-          // Merge node templates
-          if (template.nodeTemplates) {
-            Object.entries(template.nodeTemplates).forEach(
-              ([nodeTemplateName, nodeTemplate]) => {
-                mergedTemplate.topology_template.node_templates = {
-                  ...mergedTemplate.topology_template.node_templates,
-                  [nodeTemplateName]: nodeTemplate
+              // If input already exists, update only the default value
+              if (inputName in mergedTemplate.topology_template.inputs) {
+                // Preserve original input structure, only update 'default' field
+                mergedTemplate.topology_template.inputs[inputName] = {
+                  ...mergedTemplate.topology_template.inputs[inputName],
+                  default: inputTyped.default
                 };
+              } else {
+                // If it's a new input, add it as-is
+                mergedTemplate.topology_template.inputs[inputName] = input;
               }
-            );
+            }
           }
+        }
 
-          // Merge outputs
-          if (template.outputs) {
-            Object.entries(template.outputs).forEach(([outputName, output]) => {
-              mergedTemplate.topology_template.outputs = {
-                ...mergedTemplate.topology_template.outputs,
-                [outputName]: output
-              };
-            });
-          }
-        });
+        // Merge node_templates
+        if (template.nodeTemplates) {
+          Object.entries(template.nodeTemplates).forEach(
+            ([nodeTemplateName, nodeTemplate]) => {
+              mergedTemplate.topology_template.node_templates[
+                nodeTemplateName
+              ] = nodeTemplate;
+            }
+          );
+        }
+
+        // Merge outputs
+        if (template.outputs) {
+          Object.entries(template.outputs).forEach(([outputName, output]) => {
+            mergedTemplate.topology_template.outputs[outputName] = output;
+          });
+        }
+      }
+    }
+
+    // Inject image field into os.properties of each node template
+    if (typeof deployInfo !== 'undefined' && deployInfo.image) {
+      const imageValue = deployInfo.image;
+      console.log('Injecting image into node_templates:', imageValue);
+
+      const nodeTemplates = mergedTemplate.topology_template.node_templates;
+      for (const nodeTemplate of Object.values(nodeTemplates) as any[]) {
+        if (
+          nodeTemplate.capabilities && // Check if capabilities exist
+          nodeTemplate.capabilities.os && // Check if os capability exists
+          nodeTemplate.capabilities.os.properties && // Check if os.properties exists
+          typeof nodeTemplate.capabilities.os.properties === 'object'
+        ) {
+          nodeTemplate.capabilities.os.properties.image = imageValue;
+        }
       }
     }
 
     return mergedTemplate;
   } catch (error) {
     console.error('Error merging TOSCA recipes:', error);
-    return JSON.parse(JSON.stringify(parsedConstantTemplate));
+    return JSON.parse(JSON.stringify(parsedConstantTemplate)); // Fallback to original
   }
 }
 
+function getMainRecipeFileName(recipeName: string): string {
+  const normalized = recipeName.trim().toLowerCase();
+
+  const mainRecipeMap: Record<string, string> = {
+    'simple node disk': 'simple-node-disk.yaml',
+    slurm: 'slurm_cluster.yaml',
+    kubernetes: 'kubernetes.yaml'
+  };
+
+  return mainRecipeMap[normalized] ?? normalized.replace(/\s+/g, '_') + '.yaml';
+}
+
 async function createChildsForm(
-  app: string,
+  childName: string,
   index: number,
   deployDialog: HTMLElement,
   buttonsContainer: HTMLElement
 ) {
   const templatesPath = await getDeployableTemplatesPath();
-  const contentsManager = new ContentsManager();
 
-  // Load YAML content
-  const file = await contentsManager.get(
-    `${templatesPath}/${app.toLowerCase()}.yaml`
-  );
+  const recipeFileName = getMainRecipeFileName(childName);
+  const file = await contentsManager.get(`${templatesPath}/${recipeFileName}`);
 
-  // Parse YAML content
   const yamlContent = file.content as string;
   const yamlData: any = jsyaml.load(yamlContent);
   const metadata = yamlData.metadata;
@@ -372,16 +446,15 @@ async function createChildsForm(
   const nodeTemplates = yamlData.topology_template.node_templates;
   const outputs = yamlData.topology_template.outputs;
 
-  // Create child button
+  // Create button for each child
   const appButton = document.createElement('button');
   appButton.className = 'jp-Button child-buttons';
   appButton.textContent = templateName;
 
-  // Show form for the selected child when clicked
   appButton.addEventListener('click', event => {
     event.preventDefault();
     Array.from(deployDialog.querySelectorAll('form')).forEach(form => {
-      form.style.display = 'none'; // Hide all forms except the first one
+      form.style.display = 'none';
     });
     form.style.display = 'block';
   });
@@ -390,55 +463,185 @@ async function createChildsForm(
 
   // Create form
   const form = document.createElement('form');
-  form.id = `form-${app.toLowerCase()}`;
+  form.id = `form-${index}`;
+  form.setAttribute('data-childname', childName);
   deployDialog.appendChild(form);
 
-  // Show the form for the first child by default
   if (index !== 0) {
     form.style.display = 'none';
   }
 
-  // Create input fields from YAML content
   if (inputs) {
-    Object.entries(inputs).forEach(([key, input]) => {
-      const description = (input as any).description;
-      const constraints = (input as any).constraints;
+    Object.entries(inputs)
+      // Create only inputs that are not fe_* or wn_* (only applications inputs)
+      .filter(([key, _]) => !key.startsWith('fe_') && !key.startsWith('wn_'))
+      .forEach(([key, input]) => {
+        const description = (input as any).description || key;
+        const constraints = (input as any).constraints;
+        const type = (input as any).type;
+        const defaultValue = (input as any).default;
 
-      const inputField = document.createElement(
-        constraints && constraints.length > 0 && constraints[0].valid_values
-          ? 'select'
-          : 'input'
-      );
-      inputField.id = key;
-      inputField.name = key;
+        let inputField: HTMLInputElement | HTMLSelectElement;
 
-      if (
-        constraints &&
-        constraints.length > 0 &&
-        constraints[0].valid_values
-      ) {
-        const validValues = constraints[0].valid_values;
-        validValues.forEach((value: string) => {
-          const option = document.createElement('option');
-          option.value = value;
-          option.textContent = value;
-          inputField.appendChild(option);
-        });
-      }
+        if (
+          constraints &&
+          constraints.length > 0 &&
+          constraints[0].valid_values
+        ) {
+          inputField = document.createElement('select');
+          inputField.name = key;
 
-      const label = document.createElement('label');
-      label.htmlFor = key;
-      label.textContent = `${description}:`;
+          constraints[0].valid_values.forEach((value: string) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value;
+            if (value === defaultValue) {
+              option.selected = true;
+              inputField.value = defaultValue;
+            }
+            inputField.appendChild(option);
+          });
+        } else {
+          inputField = document.createElement('input');
+          inputField.name = key;
 
-      form.appendChild(label);
-      form.appendChild(inputField);
-    });
+          if (type === 'integer' || type === 'float') {
+            inputField.type = 'number';
+            if (defaultValue !== undefined) {
+              inputField.value = defaultValue;
+              inputField.placeholder = String(defaultValue);
+            }
+          } else if (type === 'boolean') {
+            inputField.type = 'checkbox';
+            (inputField as HTMLInputElement).checked =
+              defaultValue === true || defaultValue === 'true';
+          } else {
+            inputField.type = 'text';
+            if (defaultValue !== undefined) {
+              inputField.value = defaultValue;
+              inputField.placeholder = String(defaultValue);
+            }
+          }
+        }
+
+        const label = document.createElement('label');
+        label.htmlFor = key;
+        label.textContent = `${description}:`;
+
+        form.appendChild(label);
+        form.appendChild(inputField);
+      });
   } else {
-    form.innerHTML = '<p>No inputs to be filled.</p><br>';
+    const p = document.createElement('p');
+    p.textContent = 'No inputs to be filled.';
+    form.appendChild(p);
   }
 
   return {
     form,
+    nodeTemplates,
+    outputs
+  };
+}
+
+async function createImageDropdown(
+  dropdownContainer: HTMLElement,
+  nextBtn: HTMLButtonElement
+): Promise<void> {
+  const loader = document.createElement('div');
+  loader.className = 'mini-loader';
+  dropdownContainer.appendChild(loader);
+
+  try {
+    const cmdImageNames = await selectImage(deployInfo);
+    const outputText = await executeKernelCommand(cmdImageNames);
+    dropdownContainer.removeChild(loader);
+
+    await createImagesDropdown(outputText, dropdownContainer);
+
+    if (dropdownContainer.querySelector('select')) {
+      nextBtn.disabled = false;
+    }
+  } catch (error) {
+    console.error('Error loading image dropdown:', error);
+    dropdownContainer.removeChild(loader);
+  }
+}
+
+async function loadRecipeInputs(recipe: string): Promise<any | null> {
+  try {
+    const templatesPath = await getDeployableTemplatesPath();
+    const recipeFileName = getMainRecipeFileName(recipe);
+    const file = await contentsManager.get(
+      `${templatesPath}/${recipeFileName}`
+    );
+    const yamlContent = file.content as string;
+    const yamlData: any = jsyaml.load(yamlContent);
+    return yamlData?.topology_template?.inputs || null;
+  } catch (error) {
+    console.error('Failed to load recipe inputs:', error);
+    return null;
+  }
+}
+
+async function collectUserInputsFromForm(
+  form: HTMLFormElement,
+  childName: string,
+  nodeTemplates: any,
+  outputs: any
+): Promise<UserInput | null> {
+  const templatesPath = await getDeployableTemplatesPath();
+  const recipeFileName = getMainRecipeFileName(childName);
+  const file = await contentsManager.get(`${templatesPath}/${recipeFileName}`);
+  const yamlContent = file.content as string;
+  const yamlData: any = jsyaml.load(yamlContent);
+  const recipeInputs = yamlData.topology_template.inputs;
+
+  if (!recipeInputs) {
+    return null;
+  }
+
+  const inputsWithValues: Record<string, any> = {};
+
+  Object.entries(recipeInputs).forEach(([inputName, input]) => {
+    const inputDef = structuredClone(input as any);
+    const inputElement = form.querySelector<
+      HTMLInputElement | HTMLSelectElement
+    >(`[name="${CSS.escape(inputName)}"]`);
+
+    const type = inputDef.type;
+
+    if (inputElement) {
+      if (type === 'boolean') {
+        if (inputElement instanceof HTMLInputElement) {
+          inputDef.default = inputElement.checked;
+        }
+      } else {
+        const rawValue = inputElement.value.trim();
+        if (rawValue !== '') {
+          let parsedValue: any;
+          if (type === 'integer') {
+            parsedValue = parseInt(rawValue, 10);
+          } else if (type === 'float') {
+            parsedValue = parseFloat(rawValue);
+          } else {
+            parsedValue = rawValue;
+          }
+
+          inputDef.default = parsedValue;
+        }
+      }
+    } else if (deployInfo.inputs && inputName in deployInfo.inputs) {
+      inputDef.default = deployInfo.inputs[inputName];
+    }
+
+    inputsWithValues[inputName] = inputDef;
+  });
+
+  return {
+    name: childName,
+    type: 'child',
+    inputs: inputsWithValues,
     nodeTemplates,
     outputs
   };
@@ -450,36 +653,26 @@ async function createChildsForm(
 
 async function selectImage(obj: IDeployInfo): Promise<string> {
   const imClientPath = await getIMClientPath();
-  const pipeAuth = `${obj.infName}-auth-pipe`;
-
-  let cmd = `%%bash
-            PWD=$(pwd)
-            # Remove pipes if they exist
-            rm -f $PWD/${pipeAuth} &> /dev/null
-            # Create directory for templates
-            mkdir -p $PWD/templates &> /dev/null
-            # Create pipes
-            mkfifo $PWD/${pipeAuth}
-         `;
+  const authFilePath = await getAuthFilePath();
 
   // Command to create the IM-cli credentials
-  let authContent = `id = im; type = InfrastructureManager; username = ${obj.IMuser}; password = ${obj.IMpass};\n`;
+  let authContent = `id = im; type = InfrastructureManager; token = ${obj.accessToken};\n`;
   authContent += `id = ${obj.id}; type = ${obj.deploymentType}; host = ${obj.host}; `;
 
   if (obj.deploymentType === 'OpenNebula') {
     authContent += ` username = ${obj.username}; password = ${obj.password};`;
   } else if (obj.deploymentType === 'OpenStack') {
-    authContent += `username = ${obj.username}; password = ${obj.password}; tenant = ${obj.tenant}; auth_version = ${obj.authVersion};
-                domain = ${obj.domain}`;
+    authContent += `username = ${obj.username}; password = ${obj.password}; tenant = ${obj.tenant}; auth_version = ${obj.authVersion}; domain = ${obj.domain}`;
   } else if (obj.deploymentType === 'EGI') {
-    authContent += ` vo = ${obj.vo}; token = ${obj.EGIToken}`;
+    authContent += ` vo = ${obj.vo}`;
   }
 
-  cmd += `echo -e "${authContent}" > $PWD/${pipeAuth} &
+  const cmd = `%%bash
+            PWD=$(pwd)
+            # Overwrite the auth file with new content
+            echo -e "${authContent}" > $PWD/${authFilePath}
             # Create final command where the output is stored in "imageOut"
-            imageOut=$(python3 ${imClientPath} -a $PWD/${pipeAuth} -r https://im.egi.eu/im cloudimages ${obj.id})
-            # Remove pipe
-            rm -f $PWD/${pipeAuth} &> /dev/null
+            imageOut=$(python3 ${imClientPath} -a $PWD/${authFilePath} -r ${imEndpoint} cloudimages ${obj.id})
             # Print IM output on stderr or stdout
             if [ $? -ne 0 ]; then
                 >&2 echo -e $imageOut
@@ -487,78 +680,41 @@ async function selectImage(obj: IDeployInfo): Promise<string> {
             else
                 echo -e $imageOut
             fi
-            `;
+          `;
 
-  console.log('Get cloud images:', cmd);
+  // console.log('Get cloud images:', cmd);
+  console.log('Getting cloud images...');
   return cmd;
 }
-
-const getEGIToken = async () => {
-  const code = `%%bash
-                TOKEN=$(cat /var/run/secrets/egi.eu/access_token)
-                echo $TOKEN
-             `;
-  const kernelManager = new KernelManager();
-  const kernel = await kernelManager.startNew();
-  const future = kernel.requestExecute({ code });
-
-  return new Promise(resolve => {
-    future.onIOPub = async msg => {
-      const content = msg.content as any;
-      const outputText =
-        content.text || (content.data && content.data['text/plain']);
-      resolve(outputText.trim());
-    };
-  });
-};
 
 async function deployIMCommand(
   obj: IDeployInfo,
   mergedTemplate: string
 ): Promise<string> {
-  const pipeAuth = `${obj.infName}-auth-pipe`;
-  const deployedTemplatePath = await getDeployedTemplatePath();
+  const format = detectRecipeFormat(mergedTemplate);
+  console.log('Detected format:', format);
+
+  const deployedTemplatePath = await getDeployedTemplatePath(format);
   const imClientPath = await getIMClientPath();
+  const authFilePath = await getAuthFilePath();
 
-  let cmd = `%%bash
-            PWD=$(pwd)
-            # Remove pipes if they exist
-            rm -f $PWD/${pipeAuth} &> /dev/null
-            # Create directory for templates
-            mkdir -p $PWD/templates &> /dev/null
-            # Create pipes
-            mkfifo $PWD/${pipeAuth}
-            # Save mergedTemplate as a YAML file
-            echo '${mergedTemplate}' > ${deployedTemplatePath}
-          `;
+  const cmd = `%%bash
+PWD=$(pwd)
 
-  // Create the IM-cli credentials based on deployment type
-  let authContent = `id = im; type = InfrastructureManager; username = ${obj.IMuser}; password = ${obj.IMpass};\n`;
-  authContent += `id = ${obj.id}; type = ${obj.deploymentType}; `;
-
-  if (obj.deploymentType === 'EC2') {
-    authContent += `username = ${obj.username}; password = ${obj.password}; `;
-  } else if (obj.deploymentType === 'OpenNebula') {
-    authContent += `username = ${obj.username}; password = ${obj.password}; host = ${obj.host}; `;
-  } else if (obj.deploymentType === 'OpenStack') {
-    authContent += `username = ${obj.username}; password = ${obj.password}; tenant = ${obj.tenant}; auth_version = ${obj.authVersion}; domain = ${obj.domain}; host = ${obj.host}; `;
-  } else if (obj.deploymentType === 'EGI') {
-    authContent += `vo = ${obj.vo}; token = ${obj.EGIToken}; host = ${obj.host}; `;
-  }
-
-  cmd += `echo -e "${authContent}" > $PWD/${pipeAuth} &
-            # Create final command where the output is stored in "imageOut"
-            imageOut=$(python3 ${imClientPath} -a $PWD/${pipeAuth} create ${deployedTemplatePath} -r https://im.egi.eu/im)
-            # Remove pipe
-            rm -f $PWD/${pipeAuth} &> /dev/null
-            # Print IM output on stderr or stdout
-            if [ $? -ne 0 ]; then
-                >&2 echo -e $imageOut
-                exit 1
-            else
-                echo -e $imageOut
-            fi
-            `;
+# Save mergedTemplate in a file
+cat << 'EOF' > ${deployedTemplatePath}
+${mergedTemplate}
+EOF
+# Run IM CLI to deploy using the shared auth file
+imageOut=$(python3 ${imClientPath} -a $PWD/${authFilePath} create ${deployedTemplatePath} -r ${imEndpoint})
+# Print IM output on stderr or stdout
+if [ $? -ne 0 ]; then
+    >&2 echo -e $imageOut
+    exit 1
+else
+    echo -e $imageOut
+fi
+`;
 
   console.log('TOSCA recipe deployed:', cmd);
   return cmd;
@@ -585,35 +741,6 @@ async function saveToInfrastructureList(
 //*  Deployment  *//
 //****************//
 
-generateIMCredentials().then(() => {
-  console.log(
-    'Generated random IM credentials:',
-    deployInfo.IMuser,
-    deployInfo.IMpass
-  );
-});
-
-const deployChooseProvider = (dialogBody: HTMLElement): void => {
-  dialogBody.innerHTML = '';
-
-  const paragraph = document.createElement('p');
-  paragraph.textContent = 'Select infrastructure provider:';
-  dialogBody.appendChild(paragraph);
-
-  // Create buttons for each provider
-  Object.keys(providers).forEach(provider => {
-    const providerData = providers[provider as keyof typeof providers];
-    const button = createButton(provider, () => {
-      deployInfo.id = providerData.id;
-      deployInfo.deploymentType = providerData.deploymentType;
-
-      deployRecipeType(dialogBody);
-      console.log(`Provider ${provider} selected`);
-    });
-    dialogBody.appendChild(button);
-  });
-};
-
 const deployRecipeType = (dialogBody: HTMLElement): void => {
   dialogBody.innerHTML = '';
 
@@ -621,37 +748,36 @@ const deployRecipeType = (dialogBody: HTMLElement): void => {
   paragraph.textContent = 'Select recipe type:';
   dialogBody.appendChild(paragraph);
 
+  // Create recipe buttons
   recipes.forEach(recipe => {
-    // Create buttons for each recipe type
     const button = createButton(recipe.name, async () => {
-      // Remove all children except buttons
+      // Remove everything except recipe buttons
       Array.from(dialogBody.children).forEach(child => {
         if (
           !child.classList.contains('recipe-button') &&
-          !child.classList.contains('back-button')
+          child !== footerButtonContainer
         ) {
-          dialogBody.removeChild(child);
+          child.remove();
         }
       });
 
-      deployInfo.recipe = recipe.name;
+      deployInfo.recipe = recipe.name.trim().toLowerCase();
 
-      await createCheckboxesForChilds(dialogBody, recipe.childs);
+      if (recipe.name === 'Custom recipe') {
+        customRecipe(dialogBody);
+      } else {
+        await createCheckboxesForChilds(dialogBody, recipe.childs);
+      }
     });
     button.classList.add('recipe-button');
     dialogBody.appendChild(button);
   });
 
-  const backButton = createButton('Back', () => {
-    deployChooseProvider(dialogBody);
-  });
-  backButton.classList.add('back-button');
+  if (!dialogBody.contains(footerButtonContainer)) {
+    dialogBody.appendChild(footerButtonContainer);
+  }
 
-  const buttonContainer = document.createElement('div');
-  buttonContainer.classList.add('footer-button-container');
-  buttonContainer.appendChild(backButton);
-
-  dialogBody.appendChild(buttonContainer);
+  footerButtonContainer.innerHTML = '';
 };
 
 const createCheckboxesForChilds = async (
@@ -670,11 +796,11 @@ const createCheckboxesForChilds = async (
   ul.classList.add('checkbox-grid');
 
   // Load YAML files and create checkboxes
-  const contentsManager = new ContentsManager();
   const promises = childs.map(async child => {
     // Load YAML file asynchronously
+    const recipeFileName = getMainRecipeFileName(child);
     const file = await contentsManager.get(
-      `${templatesPath}/${child.toLowerCase()}.yaml`
+      `${templatesPath}/${recipeFileName}`
     );
     const yamlContent = file.content as string;
 
@@ -689,52 +815,123 @@ const createCheckboxesForChilds = async (
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.id = `${child}-checkID`;
-    checkbox.name = child;
+    checkbox.name = child.toLowerCase();
     checkbox.value = templateName;
 
     // Create label for checkbox
     const label = document.createElement('label');
-    label.htmlFor = child;
+    label.htmlFor = `${child.toLowerCase()}-checkID`;
     label.textContent = ` ${templateName}`;
-
-    // Check if recipe is Slurm or Kubernetes
-    if (
-      (deployInfo.recipe === 'Slurm' && child === 'slurm_cluster') ||
-      (deployInfo.recipe === 'Kubernetes' && child === 'kubernetes')
-    ) {
-      checkbox.checked = true; // Check the checkbox
-      checkbox.disabled = true; // Disable the checkbox
-    }
 
     // Append checkbox and label to list item
     li.appendChild(checkbox);
     li.appendChild(label);
 
-    // Append list item to checkbox grid
     ul.appendChild(li);
   });
 
   await Promise.all(promises);
 
-  // Append checkbox grid to dialog body
   dialogBody.appendChild(ul);
 
   const buttonContainer = document.createElement('div');
   buttonContainer.className = 'footer-button-container';
 
-  const backBtn = createButton('Back', () => deployChooseProvider(dialogBody));
-  backBtn.classList.add('back-button');
-  buttonContainer.appendChild(backBtn);
-
   const nextButton = createButton('Next', () => {
-    // Populate deployInfo.childs
+    // Collect selected checkboxes
     const selectedChilds = Array.from(
       dialogBody.querySelectorAll('input[type="checkbox"]:checked')
     ).map((checkbox: Element) => (checkbox as HTMLInputElement).name);
-    deployInfo.childs = selectedChilds;
-    deployProviderCredentials(dialogBody);
+
+    // Always include slurm and kubernetes if main recipe is one of them
+    const mainRecipe = deployInfo.recipe.toLowerCase();
+    const alwaysInclude = ['slurm', 'kubernetes'];
+    if (alwaysInclude.includes(mainRecipe)) {
+      selectedChilds.push(mainRecipe);
+    }
+
+    // Remove duplicates
+    deployInfo.childs = Array.from(new Set(selectedChilds));
+
+    deployChooseProvider(dialogBody);
   });
   buttonContainer.appendChild(nextButton);
+  dialogBody.appendChild(buttonContainer);
+};
+
+const customRecipe = async (dialogBody: HTMLElement): Promise<void> => {
+  dialogBody.innerHTML = '';
+  const textarea = document.createElement('textarea');
+  textarea.placeholder = 'Recipe in RADL, YAML or JSON format.';
+  textarea.classList.add('recipe-textarea');
+  dialogBody.appendChild(textarea);
+
+  const text = '<p class="form-instructions">Introduce your custom recipe.</p>';
+
+  dialogBody.insertAdjacentHTML('afterbegin', text);
+
+  const buttonContainer = document.createElement('div');
+  buttonContainer.className = 'footer-button-container';
+
+  const backBtn = createButton('Back', () => deployRecipeType(dialogBody));
+
+  const nextButton = createButton('Deploy', async () => {
+    const recipe = textarea.value;
+    resetDeployInfo();
+    deployInfo.infName = '';
+    deployInfo.id = '';
+    deployInfo.deploymentType = '';
+    deployInfo.custom = 'true';
+
+    try {
+      const cmdDeploy = await deployIMCommand(deployInfo, recipe);
+
+      dialogBody.innerHTML =
+        '<div class="loader-container"><div class="loader"></div></div>';
+
+      const outputText = await executeKernelCommand(cmdDeploy);
+      handleFinalDeployOutput(outputText, dialogBody);
+    } catch (error) {
+      Notification.error(`Deployment failed: ${error || 'Unknown error'}`, {
+        autoClose: 5000
+      });
+      deploying = false;
+    }
+  });
+
+  buttonContainer.appendChild(backBtn);
+  buttonContainer.appendChild(nextButton);
+  dialogBody.appendChild(buttonContainer);
+};
+
+const deployChooseProvider = (dialogBody: HTMLElement): void => {
+  dialogBody.innerHTML = '';
+
+  const paragraph = document.createElement('p');
+  paragraph.textContent = 'Select infrastructure provider:';
+  dialogBody.appendChild(paragraph);
+
+  // Create buttons for each provider
+  Object.keys(providers).forEach(provider => {
+    const providerData = providers[provider as keyof typeof providers];
+    const button = createButton(provider, () => {
+      deployInfo.id = providerData.id;
+      deployInfo.deploymentType = providerData.deploymentType;
+
+      deployProviderCredentials(dialogBody);
+      console.log(`Provider ${provider} selected`);
+    });
+    dialogBody.appendChild(button);
+  });
+
+  const backButton = createButton('Back', () => {
+    deployRecipeType(dialogBody);
+  });
+  backButton.classList.add('back-button');
+
+  const buttonContainer = document.createElement('div');
+  buttonContainer.classList.add('footer-button-container');
+  buttonContainer.appendChild(backButton);
 
   dialogBody.appendChild(buttonContainer);
 };
@@ -753,7 +950,7 @@ const deployProviderCredentials = async (
       const region = 'us-east-1';
       const ami = 'ami-0044130ca185d0880';
 
-      text = '<p>Introduce AWS IAM credentials.</p><br>';
+      text = '<p class="form-instructions">Introduce AWS IAM credentials.</p>';
       addFormInput(form, 'Access Key ID:', 'accessKeyId', deployInfo.username);
       addFormInput(
         form,
@@ -769,7 +966,8 @@ const deployProviderCredentials = async (
 
     case 'OpenNebula':
     case 'OpenStack':
-      text = `<p>Introduce ${deployInfo.deploymentType === 'OpenNebula' ? 'ONE' : 'OST'} credentials.</p><br>`;
+      text = `<p class="form-instructions">Introduce ${deployInfo.deploymentType === 'OpenNebula' ? 'ONE' : 'OST'} credentials.</p>`;
+
       addFormInput(form, 'Username:', 'username', deployInfo.username);
       addFormInput(
         form,
@@ -789,48 +987,34 @@ const deployProviderCredentials = async (
           deployInfo.authVersion
         );
       }
+      addFormInput(form, 'Access token:', 'access_token', '');
       break;
 
     case 'EGI':
-      text = '<p>Introduce EGI credentials.</p><br>';
+      text = '<p class="form-instructions">Introduce EGI credentials.</p>';
+
       addFormInput(form, 'VO:', 'vo', deployInfo.vo);
       addFormInput(form, 'Site name:', 'site', deployInfo.host);
+      addFormInput(form, 'Access token:', 'access_token', '');
       break;
   }
 
   form.insertAdjacentHTML('afterbegin', text);
 
-  const buttonContainer = document.createElement('div');
-  buttonContainer.className = 'footer-button-container';
+  footerButtonContainer.innerHTML = '';
 
   const backBtn = createButton('Back', () => {
-    deployRecipeType(dialogBody);
-    deployInfo.host = '';
-    deployInfo.tenant = '';
-    deployInfo.username = '';
-    deployInfo.password = '';
-    deployInfo.authVersion = '';
-    deployInfo.domain = '';
-    deployInfo.vo = '';
+    deployChooseProvider(dialogBody);
+    resetDeployInfo();
+    deployInfo.custom = 'true';
   });
+
   const nextButton = createButton('Next', async () => {
-    const form = dialogBody.querySelector('form'); // Get the form element
-    const inputs = form?.querySelectorAll('input'); // Get all input fields in the form
-
-    // Loop through each input and check if it is empty
-    let allFieldsFilled = true;
-    inputs?.forEach(input => {
-      if (!input.value) {
-        allFieldsFilled = false;
-      }
-    });
-
-    // Trigger error if any field is empty
-    if (!allFieldsFilled) {
-      Notification.error(
-        'Please fill in all required fields before continuing.',
-        { autoClose: 5000 }
-      );
+    const form = dialogBody.querySelector('form')!;
+    if (!form.reportValidity()) {
+      Notification.error('Please fill in all required fields.', {
+        autoClose: 5000
+      });
       return;
     }
 
@@ -839,7 +1023,7 @@ const deployProviderCredentials = async (
         const region = getInputValue('region');
         const AMI = getInputValue('amiIn');
         const imageURL = 'aws://' + region + '/' + AMI;
-        deployInfo.worker.image = imageURL;
+        deployInfo.image = imageURL;
         deployInfo.username = getInputValue('accessKeyId');
         deployInfo.password = getInputValue('secretAccessKey');
         break;
@@ -855,22 +1039,25 @@ const deployProviderCredentials = async (
           deployInfo.domain = getInputValue('domain');
           deployInfo.authVersion = getInputValue('authVersion');
         }
+        deployInfo.accessToken = getInputValue('access_token');
         break;
 
       case 'EGI':
         deployInfo.host = getInputValue('site');
         deployInfo.vo = getInputValue('vo');
-        deployInfo.EGIToken = await getEGIToken();
-        console.log('EGI Token:', deployInfo.EGIToken);
+        deployInfo.accessToken = getInputValue('access_token');
         break;
     }
 
     deployInfraConfiguration(dialogBody);
   });
-  buttonContainer.appendChild(backBtn);
-  buttonContainer.appendChild(nextButton);
 
-  dialogBody.appendChild(buttonContainer);
+  footerButtonContainer.appendChild(backBtn);
+  footerButtonContainer.appendChild(nextButton);
+
+  if (!dialogBody.contains(footerButtonContainer)) {
+    dialogBody.appendChild(footerButtonContainer);
+  }
 };
 
 async function deployInfraConfiguration(
@@ -881,48 +1068,79 @@ async function deployInfraConfiguration(
   dialogBody.appendChild(form);
 
   const introParagraph = document.createElement('p');
-  introParagraph.textContent = 'Introduce worker VM specifications.';
+  introParagraph.textContent =
+    'Introduce front-end and worker VM specifications.';
   form.appendChild(introParagraph);
 
   addFormInput(
     form,
-    'Infrastructure name:',
-    'infrastructureName',
-    deployInfo.infName
-  );
-  addFormInput(
-    form,
-    'Number of VMs:',
-    'infrastructureWorkers',
-    '1',
-    'number',
-    '1'
-  );
-  addFormInput(
-    form,
-    'Number of CPUs for each VM:',
-    'infrastructureCPUs',
-    '1',
-    'number',
-    '1'
-  );
-  addFormInput(form, 'Memory for each VM:', 'infrastructureMem', '2 GB');
-  addFormInput(
-    form,
-    'Size of the root disk of the VM(s):',
-    'infrastructureDiskSize',
-    '20 GB'
-  );
-  addFormInput(
-    form,
-    'Number of GPUs for each VM:',
-    'infrastructureGPUs',
-    '1',
-    'number',
-    '1'
+    'Infrastructure name',
+    'infNameInput',
+    deployInfo.infName || '',
+    'text'
   );
 
-  // Create a button container to hold Back and Next/Deploy buttons
+  const inputs = await loadRecipeInputs(deployInfo.recipe);
+
+  if (inputs) {
+    // Create form inputs for frontend and worker nodes
+    Object.entries(inputs)
+      .filter(([key, _]) => {
+        if (excludedKeys.has(key)) {
+          return false;
+        }
+        if (deployInfo.recipe === 'simple node disk') {
+          return true;
+        }
+        return key.startsWith('fe_') || key.startsWith('wn_');
+      })
+      .forEach(([key, inputDef]) => {
+        const description = (inputDef as any).description || key;
+        const constraints = (inputDef as any).constraints;
+        const defaultValue = (inputDef as any).default;
+
+        let inputField: HTMLInputElement | HTMLSelectElement;
+
+        if (
+          constraints &&
+          constraints.length > 0 &&
+          constraints[0].valid_values
+        ) {
+          inputField = document.createElement('select');
+          inputField.name = key;
+
+          constraints[0].valid_values.forEach((value: string) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value;
+            if (value === defaultValue) {
+              option.selected = true;
+            }
+            inputField.appendChild(option);
+          });
+        } else {
+          inputField = document.createElement('input');
+          inputField.type = 'text';
+          inputField.name = key;
+          inputField.placeholder = description;
+
+          if (defaultValue !== undefined && defaultValue !== null) {
+            inputField.value = defaultValue;
+          }
+        }
+
+        const label = document.createElement('label');
+        label.textContent = description;
+        label.htmlFor = inputField.name;
+        form.appendChild(label);
+        form.appendChild(inputField);
+      });
+  } else {
+    const noInputsMessage = document.createElement('p');
+    noInputsMessage.textContent = 'No frontend or worker node inputs found.';
+    form.appendChild(noInputsMessage);
+  }
+
   const buttonContainer = document.createElement('div');
   buttonContainer.className = 'footer-button-container';
   dialogBody.appendChild(buttonContainer);
@@ -933,34 +1151,60 @@ async function deployInfraConfiguration(
   buttonContainer.appendChild(backBtn);
 
   const nextBtn = createButton(
-    deployInfo.childs.length === 0 ? 'Deploy' : 'Next',
+    deployInfo.recipe === 'simple node disk' && deployInfo.childs.length === 0
+      ? 'Deploy'
+      : 'Next',
     async () => {
       try {
+        const infNameElement =
+          form.querySelector<HTMLInputElement>('#infNameInput');
+        if (infNameElement) {
+          deployInfo.infName = infNameElement.value.trim();
+        }
+
         const imageDropdown = document.getElementById(
           'imageDropdown'
         ) as HTMLSelectElement;
-
-        // Check if the dropdown exists
         if (imageDropdown) {
-          deployInfo.worker.image = imageDropdown.value;
+          deployInfo.image = imageDropdown.value;
         }
 
-        // Retrieve and parse form input values
-        deployInfo.infName = getInputValue('infrastructureName');
-        deployInfo.worker.num_instances = parseInt(
-          getInputValue('infrastructureWorkers')
-        );
-        deployInfo.worker.num_cpus = parseInt(
-          getInputValue('infrastructureCPUs')
-        );
-        deployInfo.worker.mem_size = getInputValue('infrastructureMem');
-        deployInfo.worker.disk_size = getInputValue('infrastructureDiskSize');
-        deployInfo.worker.num_gpus = parseInt(
-          getInputValue('infrastructureGPUs')
-        );
+        const allInputs = form.querySelectorAll<
+          HTMLInputElement | HTMLSelectElement
+        >('input, select');
+        allInputs.forEach(input => {
+          if (input.id === 'infNameInput') {
+            return;
+          }
 
-        // Check if we need to deploy final recipe or configure child components
-        if (deployInfo.childs.length === 0) {
+          const inputName = input.name;
+          const originalInputDef = inputs?.[inputName];
+          const type = originalInputDef?.type;
+
+          let value: any = input.value.trim();
+
+          if (value === '') {
+            return;
+          }
+
+          if (type === 'integer') {
+            value = parseInt(value, 10);
+          } else if (type === 'float') {
+            value = parseFloat(value);
+          }
+
+          originalInputDef.default = value;
+          deployInfo.inputs[inputName] = value;
+
+          // console.log(`Updated: '${inputName}' = ${value}`);
+        });
+
+        // console.log('All deployInfo.inputs:', deployInfo.inputs);
+
+        if (
+          deployInfo.recipe === 'simple node disk' &&
+          deployInfo.childs.length === 0
+        ) {
           await deployFinalRecipe(dialogBody);
         } else {
           await deployChildsConfiguration(dialogBody);
@@ -969,9 +1213,7 @@ async function deployInfraConfiguration(
         console.error('Error in deployment process:', error);
         Notification.error(
           'Check for correct provider credentials before continuing.',
-          {
-            autoClose: 5000
-          }
+          { autoClose: 5000 }
         );
       }
     }
@@ -982,33 +1224,12 @@ async function deployInfraConfiguration(
   }
   buttonContainer.appendChild(nextBtn);
 
-  // Create the dropdown container for non-EC2 types
   if (deployInfo.deploymentType !== 'EC2') {
     const dropdownContainer = document.createElement('div');
     dropdownContainer.id = 'dropdownContainer';
-
-    // Add a mini loader to the dropdown container
-    const loader = document.createElement('div');
-    loader.className = 'mini-loader';
-    dropdownContainer.appendChild(loader);
-
-    // Insert the dropdown container above the button container
     dialogBody.insertBefore(dropdownContainer, buttonContainer);
 
-    // Create select image command
-    const cmdImageNames = await selectImage(deployInfo);
-
-    try {
-      // Execute the deployment command
-      const outputText = await executeKernelCommand(cmdImageNames);
-
-      dropdownContainer.removeChild(loader); // Remove the loader once done
-
-      await createImagesDropdown(outputText, dropdownContainer); // Pass the container to hold the dropdown
-      nextBtn.disabled = false;
-    } catch (error) {
-      console.error('Error executing deployment command:', error);
-    }
+    await createImageDropdown(dropdownContainer, nextBtn);
   }
 }
 
@@ -1024,8 +1245,8 @@ const deployChildsConfiguration = async (
 
   // Create forms for child configurations
   const forms = await Promise.all(
-    childs.map((app, index) =>
-      createChildsForm(app, index, dialogBody, buttonsContainer)
+    childs.map((childName, index) =>
+      createChildsForm(childName, index, dialogBody, buttonsContainer)
     )
   );
 
@@ -1042,62 +1263,26 @@ const deployChildsConfiguration = async (
   );
 
   const nextButton = createButton('Deploy', async () => {
-    const templatesPath = await getDeployableTemplatesPath();
-    const contentsManager = new ContentsManager();
-
     const userInputs = (
       await Promise.all(
         forms.map(async formData => {
           const form = formData.form;
-          const childName = form.id.replace('form-', '');
-
-          // Fetch YAML content for the form
-          const file = await contentsManager.get(
-            `${templatesPath}/${childName}.yaml`
-          );
-          const yamlContent = file.content as string;
-          const yamlData: any = jsyaml.load(yamlContent);
-          const recipeInputs = yamlData.topology_template.inputs;
-
-          if (recipeInputs) {
-            // Create an object to hold input structure and values
-            const inputsWithValues: {
-              [key: string]: {
-                description: string;
-                default: any;
-                value: any;
-              };
-            } = {};
-
-            Object.entries(recipeInputs).forEach(([inputName, input]) => {
-              const defaultValue = (input as any).default || '';
-              const inputElement = form.querySelector<HTMLInputElement>(
-                `[name="${inputName}"]`
-              );
-              const userInput = inputElement ? inputElement.value : ''; // Handle null case
-              inputsWithValues[inputName] = {
-                description: (input as any).description,
-                default: defaultValue,
-                value: userInput
-              };
-            });
-
-            // Return the outputs to create final recipe to deploy
-            return {
-              name: childName,
-              inputs: inputsWithValues,
-              nodeTemplates: formData.nodeTemplates,
-              outputs: formData.outputs
-            };
-          } else {
-            console.error(
-              `Error: recipeInputs is null or undefined for ${childName}.yaml`
-            );
+          const childName = form.getAttribute('data-childname');
+          if (!childName) {
             return null;
           }
+
+          return await collectUserInputsFromForm(
+            form,
+            childName,
+            formData.nodeTemplates,
+            formData.outputs
+          );
         })
       )
-    ).filter((input): input is UserInput => input !== null); // Filter out null values
+    ).filter((input): input is UserInput => input !== null);
+
+    // console.log('All user inputs collected:', userInputs);
 
     deployFinalRecipe(dialogBody, userInputs, nodeTemplates, outputs);
   });
@@ -1124,27 +1309,51 @@ async function deployFinalRecipe(
   deploying = true;
 
   try {
+    if (deployInfo.childs.length === 0) {
+      const form = document.querySelector<HTMLFormElement>(
+        '[data-single-form="true"]'
+      );
+      if (form) {
+        const userInput = await collectUserInputsFromForm(
+          form,
+          deployInfo.recipe,
+          {},
+          {}
+        );
+
+        if (userInput) {
+          populatedTemplates = [userInput];
+        }
+      }
+    }
+    const recipeFileName = getMainRecipeFileName(deployInfo.recipe);
+
     const templatesPath = await getDeployableTemplatesPath();
-    const contentsManager = new ContentsManager();
     const file = await contentsManager.get(
-      `${templatesPath}/simple-node-disk.yaml`
+      `${templatesPath}/${recipeFileName}`
     );
     const yamlContent = file.content;
     const parsedTemplate = jsyaml.load(yamlContent) as any;
 
     // Add infrastructure name and a hash to the metadata
-    const hash = await computeHash(JSON.stringify(deployInfo));
     parsedTemplate.metadata = parsedTemplate.metadata || {};
-    parsedTemplate.metadata.infra_name = `jupyter_${hash}`;
+    parsedTemplate.metadata.infra_name = deployInfo.infName;
 
     // Populate the template with worker values
-    const workerInputs = parsedTemplate.topology_template.inputs;
-    Object.keys(deployInfo.worker).forEach(key => {
-      workerInputs[key] = workerInputs[key] || {
-        type: typeof deployInfo.worker[key]
-      };
-      workerInputs[key].default = deployInfo.worker[key];
+    const allInputs = { ...deployInfo.inputs };
+    const mainInputs = parsedTemplate.topology_template.inputs;
+
+    Object.entries(allInputs).forEach(([key, value]) => {
+      if (!mainInputs[key]) {
+        mainInputs[key] = {
+          type: typeof value
+        };
+      }
+      mainInputs[key].default = value;
     });
+
+    dialogBody.innerHTML =
+      '<div class="loader-container"><div class="loader"></div></div>';
 
     // Merge templates
     const mergedTemplate = await mergeTOSCARecipes(
@@ -1157,13 +1366,11 @@ async function deployFinalRecipe(
 
     const cmdDeploy = await deployIMCommand(deployInfo, mergedYamlContent);
 
-    dialogBody.innerHTML =
-      '<div class="loader-container"><div class="loader"></div></div>';
-
     const outputText = await executeKernelCommand(cmdDeploy);
     handleFinalDeployOutput(outputText, dialogBody);
   } catch (error) {
     console.error('Error during deployment:', error);
+  } finally {
     deploying = false;
   }
 }
@@ -1176,7 +1383,6 @@ const handleFinalDeployOutput = async (
     return;
   }
 
-  deploying = false;
   dialogBody.innerHTML = '';
 
   if (output.toLowerCase().includes('error')) {
@@ -1188,9 +1394,13 @@ const handleFinalDeployOutput = async (
       }
     );
 
-    deployInfo.childs.length === 0
-      ? deployInfraConfiguration(dialogBody)
-      : deployChildsConfiguration(dialogBody);
+    if (deployInfo.custom === 'true') {
+      customRecipe(dialogBody);
+    } else {
+      deployInfo.childs.length === 0
+        ? deployInfraConfiguration(dialogBody)
+        : deployChildsConfiguration(dialogBody);
+    }
   } else {
     dialogBody.innerHTML = `
         <div class="success-container">
@@ -1211,8 +1421,7 @@ const handleFinalDeployOutput = async (
 
     // Create a JSON object for infrastructure data
     const infrastructureData: IInfrastructureData = {
-      IMuser: deployInfo.IMuser,
-      IMpass: deployInfo.IMpass,
+      accessToken: deployInfo.accessToken,
       name: deployInfo.infName,
       infrastructureID,
       id: deployInfo.id,
@@ -1224,7 +1433,7 @@ const handleFinalDeployOutput = async (
       authVersion: deployInfo.authVersion,
       domain: deployInfo.domain,
       vo: deployInfo.vo,
-      EGIToken: deployInfo.EGIToken
+      custom: deployInfo.custom
     };
 
     const cmdSave = await saveToInfrastructureList(infrastructureData);
@@ -1237,13 +1446,7 @@ const handleFinalDeployOutput = async (
       console.error('Error executing kernel command:', error);
       deploying = false;
     }
-    deployInfo.host = '';
-    deployInfo.tenant = '';
-    deployInfo.username = '';
-    deployInfo.password = '';
-    deployInfo.authVersion = '';
-    deployInfo.domain = '';
-    deployInfo.vo = '';
+    resetDeployInfo();
   }
 };
 

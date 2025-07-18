@@ -1,23 +1,36 @@
-from tabulate import tabulate
-from IPython.core.magic import Magics, line_magic, line_cell_magic, magics_class
-from subprocess import run, PIPE, CalledProcessError
-from pathlib import Path
-from imclient import IMClient
+"""
+This module defines the ApricotMagics class for custom IPython magics related
+to virtual infrastructure management using the Infrastructure Manager (IM) tool.
+"""
 
-import requests
-import jwt
 import time
 import os
 import json
 import sys
+from pathlib import Path
+from subprocess import run, PIPE, CalledProcessError
 
-IM_ENDPOINT = "https://im.egi.eu/im"
+import requests
+import jwt
+from tabulate import tabulate
+from IPython.core.magic import Magics, line_magic, line_cell_magic, magics_class
+
+from imclient import IMClient
+
+# IM_ENDPOINT = "https://deploy.sandbox.eosc-beyond.eu"
+IM_ENDPOINT = "https://im.egi.eu/"
 
 
 @magics_class
-class Apricot_Magics(Magics):
+class ApricotMagics(Magics):
+    """
+    IPython magics for managing virtual infrastructures using IM.
+    """
 
     def __init__(self, shell):
+        """
+        Initialize the ApricotMagics class with token and client setup.
+        """
         super().__init__(shell)
         self.load_paths()
 
@@ -84,27 +97,7 @@ class Apricot_Magics(Magics):
 
         except CalledProcessError as e:
             print(f"Error: {e.stderr}")
-
-    def generate_key(self, inf_id, vm_id):
-        """Generates private key and host IP from infrastructure and VM info."""
-        try:
-            self.initialize_im_client()
-            success, inf_key = self.client.getinfo(
-                inf_id, "disk.0.os.credentials.private_key"
-            )
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return "Failed"
-
-        private_key_content = list(inf_key)[0][2]
-
-        if private_key_content:
-            with open("key.pem", "w") as key_file:
-                key_file.write(private_key_content)
-            os.chmod("key.pem", 0o600)
-
-        return private_key_content
+            return None
 
     def resolve_ssh_user(self, inf_id):
         try:
@@ -113,21 +106,46 @@ class Apricot_Magics(Magics):
                 inf_id, "disk.0.os.credentials.username"
             )
 
+            if not success or not inf_info:
+                return "Could not retrieve SSH username."
+
+            ssh_username = list(inf_info)[0][2]
+            return ssh_username
+
         except Exception as e:
-            print(f"Error: {e}")
-            return "Failed"
+            print(f"Error resolving SSH user: {e}")
+            return None
 
-        ssh_username = list(inf_info)[0][2]
+    def generate_key(self, inf_id, vm_id):
+        """Generates private key from infrastructure information."""
+        try:
+            self.initialize_im_client()
+            success, inf_key = self.client.getinfo(
+                inf_id, "disk.0.os.credentials.private_key"
+            )
 
-        return ssh_username
+            if not success:
+                print("Failed to retrieve private key from infrastructure.")
+                return None
+
+            private_key_content = list(inf_key)[0][2]
+
+            if private_key_content:
+                with open("key.pem", "w") as key_file:
+                    key_file.write(private_key_content)
+                os.chmod("key.pem", 0o600)
+                return private_key_content
+            else:
+                print("Private key content is empty.")
+                return None
+
+        except Exception as e:
+            print(f"Error generating key: {e}")
+            return None
 
     def apricot_transfer(self, inf_id, vm_id, files, destination, transfer_type):
         """Handle SCP upload and download."""
-        try:
-            self.authfile_path
-        except ValueError as e:
-            print(e)
-            return "Failed"
+        self.authfile_path
 
         # Generate private key content and host IP
         private_key_content = self.generate_key(inf_id, vm_id)
@@ -173,6 +191,10 @@ class Apricot_Magics(Magics):
 
         self.cleanup_files("key.pem")
 
+        if output is None:
+            return "SCP command failed."
+
+        print(output)
         return "Done"
 
     def remove_infrastructure_from_list(self, inf_id):
@@ -198,28 +220,30 @@ class Apricot_Magics(Magics):
             return "Failed"
 
     def get_infrastructure_state(self, inf_id):
+        """
+        Retrieves the current state of the given infrastructure.
+        """
         try:
             self.initialize_im_client()
-            success, inf_info = self.client.get_infra_property(inf_id, "state")
-            state = inf_info.get("state", "Error getting status info")
+            _, inf_info = self.client.get_infra_property(inf_id, "state")
+            return inf_info.get("state", "Error getting status info")
 
         except Exception as e:
             print(f"Error: {e}")
             return "Failed"
-
-        return state
 
     def get_vm_ip(self, inf_id):
+        """
+        Retrieves the public IP of the virtual machine in the given infrastructure.
+        """
         try:
             self.initialize_im_client()
-            success, inf_info = self.client.get_infra_property(inf_id, "outputs")
-            ip = inf_info.get("node_ip")
+            _, inf_info = self.client.get_infra_property(inf_id, "outputs")
+            return inf_info.get("node_ip")
 
         except Exception as e:
             print(f"Error: {e}")
             return "Failed"
-
-        return ip
 
     ########################
     #    Manage tokens     #
@@ -335,74 +359,96 @@ class Apricot_Magics(Magics):
 
     @line_magic
     def apricot_token(self, line):
-        data = self.load_json(self.inf_list_path)
-
-        if not line:
-            refresh_token = data.get("refresh_token", "").strip()
-
-            if not refresh_token:
-                print(
-                    "No refresh token found. Please provide one by running `%apricot_token <refresh_token>`"
-                )
-                return
-            else:
-                self.generate_new_access_token(refresh_token)
-                return
-
-        # If a new token is provided via command line
-        refresh_token = line.strip()
-        data["refresh_token"] = refresh_token
-
-        with open(self.inf_list_path, "w") as f:
-            json.dump(data, f, indent=4)
-
-        self.generate_new_access_token(refresh_token)
-
-    @line_magic
-    def apricot_log(self, line):
-        if not line:
-            return "Usage: `%apricot_log <infrastructure-id>`\n"
-
-        inf_id = line.split()[0]
-
+        """
+        Sets or refreshes the access token using a refresh token.
+        If called with no argument, it tries to use the saved refresh token.
+        """
         try:
-            self.initialize_im_client()
-            success, inf_info = self.client.get_infra_property(inf_id, "contmsg")
+            data = self.load_json(self.inf_list_path)
+
+            if not line:
+                refresh_token = data.get("refresh_token", "").strip()
+
+                if not refresh_token:
+                    print(
+                        "No refresh token found. Please provide one by running "
+                        "`%apricot_token <refresh_token>`"
+                    )
+                    return "Failed"
+
+                self.generate_new_access_token(refresh_token)
+                return "Done"
+
+            # If a new token is provided via command line
+            refresh_token = line.strip()
+            data["refresh_token"] = refresh_token
+
+            with open(self.inf_list_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+
+            self.generate_new_access_token(refresh_token)
+            return "Done"
 
         except Exception as e:
             print(f"Error: {e}")
             return "Failed"
 
+    @line_magic
+    def apricot_log(self, line):
+        """
+        Displays the log message (contmsg) of a specific infrastructure.
+        """
+        if not line:
+            return "Usage: `%apricot_log <infrastructure-id>`\n"
+
+        inf_id = line.strip().split()[0]
+
+        try:
+            self.initialize_im_client()
+            success, inf_info = self.client.get_infra_property(inf_id, "contmsg")
+        except Exception as e:
+            print(f"Error: {e}")
+            return "Failed"
+
+        if not success:
+            print(f"Error: {inf_info}")
+            return "Failed"
+
         print(inf_info)
+        return "Done"
 
     @line_magic
     def apricot_ls(self, line):
+        """
+        Lists all tracked infrastructures with their name, ID, IP, and status.
+        """
         infrastructures_list = []
 
-        data = self.load_json(self.inf_list_path)
+        try:
+            data = self.load_json(self.inf_list_path)
 
-        for infrastructure in data.get("infrastructures", []):
-            infrastructure_info = {
-                "Name": infrastructure.get("name", ""),
-                "InfrastructureID": infrastructure.get("infrastructureID", ""),
-                "IP": "",
-                "State": "",
-            }
+            for infrastructure in data.get("infrastructures", []):
+                infrastructure_info = {
+                    "Name": infrastructure.get("name", ""),
+                    "InfrastructureID": infrastructure.get("infrastructureID", ""),
+                    "IP": "",
+                    "State": "",
+                }
 
-            try:
-                self.authfile_path
-                infrastructure_info["State"] = self.get_infrastructure_state(
-                    infrastructure_info["InfrastructureID"]
-                )
-                infrastructure_info["IP"] = self.get_vm_ip(
-                    infrastructure_info["InfrastructureID"]
-                )
+                infra_id = infrastructure_info["InfrastructureID"]
 
-            except Exception as e:
-                print(f"Error: {e}")
-                return "Failed"
+                # Retrieve State and IP
+                state = self.get_infrastructure_state(infra_id)
+                ip = self.get_vm_ip(infra_id)
 
-            infrastructures_list.append(infrastructure_info)
+                infrastructure_info["State"] = state
+                infrastructure_info["IP"] = ip
+
+                infrastructures_list.append(infrastructure_info)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return "Failed"
 
         infrastructure_data = [
             [infra["Name"], infra["InfrastructureID"], infra["IP"], infra["State"]]
@@ -422,55 +468,61 @@ class Apricot_Magics(Magics):
             )
         )
 
+        return "Done"
+
     @line_magic
     def apricot_info(self, line):
+        """
+        Displays detailed information about a specific infrastructure ID.
+        """
         if not line:
             return "Usage: `%apricot_info infrastructure-id`\n"
 
-        inf_id = line.split()[0]
+        inf_id = line.strip().split()[0]
 
         try:
             self.initialize_im_client()
             success, inf_info = self.client.getinfo(inf_id)
-
         except Exception as e:
             print(f"Error: {e}")
+            return "Failed"
+
+        if not success:
+            print(f"Error: {inf_info}")
             return "Failed"
 
         for item in inf_info:
             print(*item, sep="\n")
 
-        # @line_magic
-        # def apricot_vmls(self, line):
-        if not line:
-            print("Usage: `%apricot_vmls infrastructure-id`\n")
-            return "Fail"
+        return "Done"
 
-        inf_id = line.split()[0]
+    @line_magic
+    def apricot_vmls(self, line):
+        """
+        Lists virtual machines for a given infrastructure ID.
+        """
+        if not line:
+            print("Usage: `%apricot_vmls <infrastructure-id>`\n")
+            return "Failed"
+
+        inf_id = line.strip().split()[0]
         vm_info_list = []
 
         try:
             self.initialize_im_client()
-            success, inf_info = self.client.getinfo(inf_id)
-
+            _, inf_info = self.client.getinfo(inf_id)
         except Exception as e:
             print(f"Error: {e}")
             return "Failed"
 
         for item in inf_info:
             vm_id = item[0]
-            (
-                net_interface_ip,
-                provider_type,
-                disk_size,
-                cpu_count,
-                memory_size,
-                gpu_count,
-            ) = (None, None, None, None, None, None)
+            output_string = item[2]  # The third element contains the VM details
 
-            output_string = item[
-                2
-            ]  # The third element contains the VM details as a string
+            net_interface_ip = provider_type = disk_size = cpu_count = memory_size = (
+                gpu_count
+            ) = None
+
             for line in output_string.split("\n"):
                 if "net_interface.0.ip =" in line:
                     net_interface_ip = (
@@ -489,36 +541,18 @@ class Apricot_Magics(Magics):
                 if "gpu.count >=" in line:
                     gpu_count = line.split(">= ")[1].strip().strip("'").split(" ")[0]
 
-            start_time = time.time()
-            while not all(
-                (
+            vm_info_list.append(
+                [
                     vm_id,
                     net_interface_ip,
                     provider_type,
                     disk_size,
                     cpu_count,
                     memory_size,
-                    memory_size,
-                )
-            ):  # Ensure valid values
-                if time.time() - start_time > 4:
-                    break
-                # time.sleep(1)
+                    gpu_count,
+                ]
+            )
 
-                # if all((vm_id, net_interface_ip, provider_type, disk_size, cpu_count, memory_size, gpu_count)):
-                vm_info_list.append(
-                    [
-                        vm_id,
-                        net_interface_ip,
-                        provider_type,
-                        disk_size,
-                        cpu_count,
-                        memory_size,
-                        gpu_count,
-                    ]
-                )
-
-        # Print table
         print(
             tabulate(
                 vm_info_list,
@@ -535,13 +569,16 @@ class Apricot_Magics(Magics):
             )
         )
 
-        return
+        return "Done"
 
-    @line_cell_magic
+    @line_magic
     def apricot_create(self, line):
+        """
+        Creates a new infrastructure using a given description in JSON, YAML, or RADL format.
+        """
         if not line:
             print("Usage: `%apricot_create <recipe>`\n")
-            return "Fail"
+            return "Failed"
 
         inf_desc = line
 
@@ -556,61 +593,90 @@ class Apricot_Magics(Magics):
             self.initialize_im_client()
             success, inf_info = self.client.create(inf_desc, desc_type)
 
+            if not success:
+                print(f"Error: {inf_info}")
+                return "Failed"
+
+            print("Infrastructure with ID " + inf_info + " successfully created.")
+
+            data = self.load_json(self.inf_list_path)
+            data["infrastructures"].append({"infrastructureID": inf_info})
+
+            with open(self.inf_list_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+
+            return "Done"
+
         except Exception as e:
             print(f"Error: {e}")
             return "Failed"
 
-        if "error" in inf_info.lower():
-            print(inf_info)
-        else:
-            print("Infrastructure with ID " + inf_info + " successfully created.")
-
-            data = self.load_json(self.inf_list_path)
-
-            new_infra = {"infrastructureID": inf_info}
-            data["infrastructures"].append(new_infra)
-
-            with open(self.inf_list_path, "w") as f:
-                json.dump(data, f, indent=4)
-
     @line_magic
     def apricot_upload(self, line):
-        if len(line) == 0 or len(line.split()) < 3:
+        """
+        Uploads one or more local files to a remote infrastructure VM.
+        """
+        if not line or len(line.split()) < 3:
             print(
-                "Usage: `%apricot_upload <infrastructure-id> <file1> <file2> ... <fileN> <remote-destination-path>`\n"
+                "Usage: `%apricot_upload <infrastructure-id> <file1> <file2> "
+                "... <fileN> <remote-destination-path>`\n"
             )
-            return "Fail"
+            return "Failed"
 
-        words = line.split()
-        inf_id = words[0]
-        vm_id = "0"  # words[1]
-        destination = words[-1]
-        files = words[1:-1]
+        try:
+            words = line.split()
+            inf_id = words[0]
+            vm_id = "0"
+            destination = words[-1]
+            files = words[1:-1]
 
-        return self.apricot_transfer(
-            inf_id, vm_id, files, destination, transfer_type="upload"
-        )
+            result = self.apricot_transfer(
+                inf_id, vm_id, files, destination, transfer_type="upload"
+            )
+
+            return result if result else "Done"
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return "Failed"
 
     @line_magic
     def apricot_download(self, line):
-        if len(line) == 0 or len(line.split()) < 3:
+        """
+        Downloads one or more files from a remote infrastructure VM to the local machine.
+        """
+        if not line or len(line.split()) < 3:
             print(
-                "Usage: `%apricot_download <infrastructure-id> <file1> <file2> ... <fileN> <local-destination-path>`\n"
+                "Usage: `%apricot_download <infrastructure-id> <file1> <file2> "
+                "... <fileN> <local-destination-path>`\n"
             )
-            return "Fail"
+            return "Failed"
 
-        words = line.split()
-        inf_id = words[0]
-        vm_id = "0"  # words[1]
-        destination = words[-1]
-        files = words[1:-1]
+        try:
+            words = line.split()
+            inf_id = words[0]
+            vm_id = "0"
+            destination = words[-1]
+            files = words[1:-1]
 
-        return self.apricot_transfer(
-            inf_id, vm_id, files, destination, transfer_type="download"
-        )
+            result = self.apricot_transfer(
+                inf_id, vm_id, files, destination, transfer_type="download"
+            )
+
+            return result if result else "Done"
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return "Failed"
 
     @line_magic
     def apricot_destroy(self, inf_id):
+        """
+        Destroys a deployed infrastructure.
+        """
+        if not inf_id:
+            return "Usage: `%apricot_destroy <infrastructure-id>`"
+
         try:
             self.initialize_im_client()
 
@@ -622,22 +688,25 @@ class Apricot_Magics(Magics):
 
             success, inf_info = self.client.destroy(inf_id)
 
-            if success == True:
-                sys.stdout.write(
-                    "\r" + " " * 80 + "\r"
-                )  # Overwrite the line with spaces
-                sys.stdout.flush()
-                print("Infrastructure with ID " + inf_id + " successfully destroyed.")
-                self.remove_infrastructure_from_list(inf_id)
+            if not success:
+                print(f"Error: {inf_info}")
+                return "Failed"
+
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
+            print("Infrastructure with ID " + inf_id + " successfully destroyed.")
+
+            self.remove_infrastructure_from_list(inf_id)
+
+            print(inf_info)
+            return "Done"
 
         except Exception as e:
             print(f"Error: {e}")
             return "Failed"
 
-        print(inf_info)
-
-    @line_cell_magic
-    def apricot(self, code, cell=None):
+    # @line_cell_magic
+    # def apricot(self, code, cell=None):
         # Check if it's a cell call
         if cell is not None:
             lines = cell.split("\n")
@@ -659,7 +728,8 @@ class Apricot_Magics(Magics):
         if word1 in {"exec"}:
             if len(words) < 3:
                 print(
-                    f"Incomplete instruction: '{code}' \n 'exec' format is: 'exec infrastructure-id cmd-command'"
+                    f"Incomplete instruction: '{code}' \n 'exec' format is: "
+                    "'exec <infrastructure-id> <cmd-command>'"
                 )
                 return "Fail"
             else:
@@ -731,6 +801,116 @@ class Apricot_Magics(Magics):
 
         return "Done"
 
+    @line_cell_magic
+    def apricot(self, code, cell=None):
+        """
+        %apricot <command>
+        Runs an apricot command:
+        - exec <infra-id> <cmd>
+        - list
+        - destroy <infra-id>
+        Or use as cell to run multiple lines.
+        """
+        # Handle cell mode (multi-line execution)
+        if cell:
+            lines = cell.strip().split("\n")
+            for line in lines:
+                if line.strip():
+                    result = self.apricot(line.strip())
+                    if result != "Done":
+                        print("Execution stopped.")
+                        return f"Fail on line: '{line.strip()}'"
+            return "Done"
+
+        # Single-line usage
+        if not code.strip():
+            print("Usage: %apricot <exec|list|destroy> [args]")
+            return "Failed"
+
+        words = [w for w in code.strip().split() if w]
+        if not words:
+            return "Failed"
+
+        command = words[0]
+
+        # ----------------------------
+        # Handle 'exec' command
+        # ----------------------------
+        if command == "exec":
+            if len(words) < 3:
+                print("Usage: exec <infrastructure-id> <cmd-command>")
+                return "Failed"
+
+            inf_id = words[1]
+            cmd_command = words[2:]
+
+            try:
+                _ = self.authfile_path
+            except ValueError as e:
+                print(f"Authfile error: {e}")
+                return "Failed"
+
+            ssh_user = self.resolve_ssh_user(inf_id)
+            if not ssh_user:
+                print(f"Error: Unable to resolve SSH user for infrastructure '{inf_id}'.")
+                return "Failed"
+
+            private_key_content = self.generate_key(inf_id, "0")
+            if not private_key_content:
+                print("Error: Failed to generate private key.")
+                return "Failed"
+
+            host_ip = self.get_vm_ip(inf_id)
+            if not host_ip:
+                print(f"Error: Unable to resolve IP for infrastructure '{inf_id}'.")
+                return "Failed"
+
+            cmd_ssh = [
+                "ssh",
+                "-i", "key.pem",
+                "-o", "StrictHostKeyChecking=no",
+                f"{ssh_user}@{host_ip}",
+            ] + cmd_command
+
+            output = self.execute_command(cmd_ssh)
+            if output:
+                print(output)
+
+            self.cleanup_files("key.pem")
+            return "Done"
+
+        # ----------------------------
+        # Handle 'list' command
+        # ----------------------------
+        elif command == "list":
+            return self.apricot_ls("")
+
+        # ----------------------------
+        # Handle 'destroy' command
+        # ----------------------------
+        elif command == "destroy":
+            if len(words) != 2:
+                print("Usage: destroy <infrastructure-id>")
+                return "Failed"
+
+            inf_id = words[1]
+
+            try:
+                _ = self.authfile_path
+            except ValueError as e:
+                print(f"Status: fail. {e}\n")
+                return "Failed"
+
+            self.apricot_destroy(inf_id)
+            return "Done"
+
+        # ----------------------------
+        # Unknown command
+        # ----------------------------
+        else:
+            print(f"Unknown command: '{command}'")
+            return "Failed"
+
 
 def load_ipython_extension(ipython):
     """
@@ -738,4 +918,4 @@ def load_ipython_extension(ipython):
     can be loaded via `%load_ext module.path` or be configured to be
     autoloaded by IPython at startup time.
     """
-    ipython.register_magics(Apricot_Magics)
+    ipython.register_magics(ApricotMagics)

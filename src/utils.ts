@@ -17,15 +17,23 @@ export async function executeKernelCommand(command: string): Promise<string> {
   const kernelInstance = await getOrStartKernel();
   const future = kernelInstance.requestExecute({ code: command });
 
+  let outputText = '';
+  let timeout: NodeJS.Timeout;
+
   return new Promise((resolve, reject) => {
+    // Listen for output
     future.onIOPub = (msg: { content: any }) => {
       const content = msg.content;
-      const outputText =
+      const currentOutput =
         content.text || (content.data && content.data['text/plain']);
 
-      // Resolve the promise with the output text if it exists
-      if (outputText) {
-        resolve(outputText.trim());
+      // If there is output, accumulate it
+      if (currentOutput) {
+        outputText += currentOutput;
+        clearTimeout(timeout); // Reset timeout if data comes in early
+        timeout = setTimeout(() => {
+          resolve(outputText.trim()); // Resolve after a delay to ensure all data is received
+        }, 500); // 500ms delay before resolving
       }
     };
 
@@ -64,14 +72,16 @@ export async function getIMClientPath(): Promise<string> {
   );
 }
 
-export async function getDeployedTemplatePath(): Promise<string> {
+export async function getDeployedTemplatePath(
+  ext: 'yaml' | 'json' | 'radl'
+): Promise<string> {
   const cmdDeployedTemplatePath = `
     %%bash
-    realpath --relative-to="$(pwd)" resources/deployed-template.yaml
+    realpath --relative-to="$(pwd)" resources/deployed-template.${ext}
   `;
   return getPath(
     cmdDeployedTemplatePath,
-    'Failed to find deployed-template.yaml. Maybe it is not in the resources folder. Check the console for more details.'
+    `Failed to find resources/deployed-template.${ext}. Maybe it is not in the resources folder. Check the console for more details.`
   );
 }
 
@@ -82,7 +92,7 @@ export async function getInfrastructuresListPath(): Promise<string> {
   `;
   return getPath(
     cmdInfrastructuresListPath,
-    'Failed to find infrastructuresList.json. Maybe it is not in the resources folder. Check the console for more details.'
+    'Failed to find resources/infrastructuresList.json. Maybe it is not in the resources folder. Check the console for more details.'
   );
 }
 
@@ -93,6 +103,38 @@ export async function getDeployableTemplatesPath(): Promise<string> {
   `;
   return getPath(
     cmdTemplatesPath,
-    'Failed to find deployable_templates/ directory. Maybe it is not in the project folder. Check the console for more details.'
+    'Failed to find resources/deployable_templates/ directory. Maybe it is not in the project folder. Check the console for more details.'
   );
 }
+
+export async function getAuthFilePath(): Promise<string> {
+  const cmdTemplatesPath = `
+    %%bash
+    realpath --relative-to="$(pwd)" resources/authfile
+  `;
+  return getPath(
+    cmdTemplatesPath,
+    'Failed to find resources/authfile directory. Maybe it is not in the project folder. Check the console for more details.'
+  );
+}
+
+export const createButton = (
+  label: string,
+  onClick: () => void
+): HTMLButtonElement => {
+  const button = document.createElement('button');
+  button.textContent = label;
+  button.className = 'jp-Button';
+
+  // Add footer-button class for specific buttons
+  if (['Back', 'Next', 'Deploy'].includes(label)) {
+    button.classList.add('footer-button');
+  }
+
+  if (label === 'Delete') {
+    button.classList.add('jp-mod-styled', 'jp-mod-warn');
+  }
+
+  button.addEventListener('click', onClick);
+  return button;
+};
